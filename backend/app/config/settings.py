@@ -32,11 +32,11 @@ class Settings:
     # ==========================
     DEFAULT_TOP_K = 5
     MAX_TOP_K = 20
-    SIMILARITY_THRESHOLD = 0.30
+    SIMILARITY_THRESHOLD = 0.45
     # ==========================
     # Gemini
     # ==========================
-    GEMINI_MODEL = "gemini-2.5-flash"
+    GEMINI_MODEL = "gemini-3.6-flash"
 
     # ==========================
     # Upload Directory

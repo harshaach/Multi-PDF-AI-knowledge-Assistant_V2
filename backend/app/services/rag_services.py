@@ -1,4 +1,5 @@
 from google import genai
+import time
 
 from app.config.settings import settings
 from app.services.embedding_services import EmbeddingService
@@ -6,12 +7,22 @@ from app.services.embedding_services import EmbeddingService
 
 class RAGService:
     """
-    Intelligent RAG Service
+    Retrieval-first RAG Service.
 
-    Supports:
-    - DOCUMENT queries
-    - GENERAL queries
-    - HYBRID queries
+    Pipeline:
+
+    Question
+        ↓
+    FAISS Retrieval
+        ↓
+    Similarity Threshold (0.45)
+        ↓
+    Relevant?
+      ├── YES → Document RAG + Gemini
+      └── NO  → General Gemini
+
+    This removes the Gemini query-router call from
+    the normal query path, reducing latency and API usage.
     """
 
     def __init__(
@@ -23,56 +34,6 @@ class RAGService:
         self.client = genai.Client(api_key=api_key)
 
     # --------------------------------------------------
-    # Query Router
-    # --------------------------------------------------
-
-    def route_query(self, question: str) -> str:
-        """
-        Decide whether the query should use:
-
-        DOCUMENT
-        GENERAL
-        HYBRID
-        """
-
-        router_prompt = f"""
-You are an intelligent query router.
-
-Your job is to classify the user's question into ONLY ONE category.
-
-DOCUMENT
-- The answer should come ONLY from uploaded documents.
-
-GENERAL
-- The answer is general knowledge.
-- Uploaded documents are NOT required.
-
-HYBRID
-- The answer requires BOTH uploaded documents and general knowledge.
-
-Reply with ONLY one word.
-
-DOCUMENT
-GENERAL
-HYBRID
-
-Question:
-{question}
-"""
-
-        response = self.client.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=router_prompt,
-        )
-
-        route = response.text.strip().upper()
-
-        if route not in ["DOCUMENT", "GENERAL", "HYBRID"]:
-            route = "DOCUMENT"
-
-        return route
-
-    # --------------------------------------------------
     # Main RAG Pipeline
     # --------------------------------------------------
 
@@ -81,121 +42,158 @@ Question:
         question: str,
         top_k: int = settings.DEFAULT_TOP_K,
     ):
-        route = self.route_query(question)
-        print(f"Route: {route}")
+        total_start = time.perf_counter()
 
-        print(f"\nQuery Route: {route}")
+        print("\n" + "=" * 60)
+        print("RAG DIAGNOSTIC")
+        print("=" * 60)
+        print(f"Question: {question}")
 
-        # ==========================================
-        # GENERAL KNOWLEDGE
-        # ==========================================
+        # --------------------------------------------------
+        # 1. RETRIEVAL
+        # --------------------------------------------------
 
-        if route == "GENERAL":
-
-            response = self.client.models.generate_content(
-                model=settings.GEMINI_MODEL,
-                contents=question,
-            )
-
-            return {
-                "answer": response.text,
-                "sources": [],
-            }
-
-        # ==========================================
-        # DOCUMENT / HYBRID
-        # ==========================================
+        retrieval_start = time.perf_counter()
 
         retrieved = self.embedding_service.search(
             question,
             top_k,
-            
         )
-        print(f"Retrieved Chunks: {len(retrieved)}")
+
+        retrieval_time = (
+            time.perf_counter() - retrieval_start
+        )
+
+        print(
+            f"Retrieval time: "
+            f"{retrieval_time:.4f} sec"
+        )
+
+        print(
+            f"Retrieved chunks: "
+            f"{len(retrieved)}"
+        )
+
+        # --------------------------------------------------
+        # 2. NO RELEVANT DOCUMENT CONTEXT
+        # --------------------------------------------------
 
         if not retrieved:
 
-            if route == "DOCUMENT":
+            print(
+                "NO CHUNKS PASSED THE SIMILARITY THRESHOLD"
+            )
 
-                return {
-                    "answer": "I couldn't find sufficient information in the uploaded documents.",
-                    "sources": [],
-                }
+            llm_start = time.perf_counter()
 
             response = self.client.models.generate_content(
                 model=settings.GEMINI_MODEL,
                 contents=question,
             )
 
+            llm_time = (
+                time.perf_counter() - llm_start
+            )
+
+            total_time = (
+                time.perf_counter() - total_start
+            )
+
+            print(
+                f"LLM generation time: "
+                f"{llm_time:.4f} sec"
+            )
+
+            print(
+                f"Total query time: "
+                f"{total_time:.4f} sec"
+            )
+
+            print("=" * 60)
+
             return {
                 "answer": response.text,
                 "sources": [],
             }
 
-        context = ""
+        # --------------------------------------------------
+        # 3. RETRIEVAL DETAILS
+        # --------------------------------------------------
 
+        print("\nRetrieved chunks:")
+
+        for i, (chunk, score) in enumerate(
+            retrieved,
+            start=1,
+        ):
+            print(
+                f"{i}. "
+                f"file={chunk.filename}, "
+                f"page={chunk.page_number}, "
+                f"chunk={chunk.chunk_index}, "
+                f"score={score:.4f}"
+            )
+
+        # --------------------------------------------------
+        # 4. CONTEXT CONSTRUCTION
+        # --------------------------------------------------
+
+        context_start = time.perf_counter()
+
+        context_parts = []
         sources = set()
 
         for chunk, score in retrieved:
 
-            context += (
-                f"\n\n"
-                f"[Source: {chunk.filename}]"
-                f"\nSimilarity: {score:.3f}\n"
+            context_parts.append(
+                f"[Source: {chunk.filename}]\n"
+                f"Page: {chunk.page_number}\n"
+                f"Similarity: {score:.3f}\n"
                 f"{chunk.text}"
             )
 
-            sources.add(chunk.filename)
+            sources.add(
+                f"{chunk.filename} - Page {chunk.page_number}"
+            )
 
-        # ==========================================
-        # DOCUMENT MODE
-        # ==========================================
+        context = "\n\n".join(context_parts)
 
-        if route == "DOCUMENT":
+        context_time = (
+            time.perf_counter() - context_start
+        )
 
-            prompt = f"""
+        print(
+            f"Context construction time: "
+            f"{context_time:.4f} sec"
+        )
+
+        print(
+            f"Context characters: "
+            f"{len(context)}"
+        )
+
+        # --------------------------------------------------
+        # 5. DOCUMENT RAG PROMPT
+        # --------------------------------------------------
+
+        prompt = f"""
 You are an AI Knowledge Assistant.
 
-Use ONLY the uploaded document context.
-
-Instructions:
-
-- Do NOT use outside knowledge.
-- If the answer is not available,
-say:
-
-"I couldn't find sufficient information in the uploaded documents."
-
-Context:
-
-{context}
-
-Question:
-
-{question}
-
-Answer:
-"""
-
-        # ==========================================
-        # HYBRID MODE
-        # ==========================================
-
-        else:
-
-            prompt = f"""
-You are an AI Knowledge Assistant.
-
-Use BOTH:
-
-1. Uploaded document context
-2. Your own general knowledge
+Answer the user's question using ONLY
+the retrieved document context below.
 
 Rules:
 
-- Prioritize uploaded documents.
-- Use general knowledge only to improve explanations.
-- Clearly combine both sources.
+- Use only the provided document context.
+- Do not use outside knowledge.
+- Do not invent information.
+- If the answer cannot be determined from
+  the provided context, say:
+
+"I couldn't find sufficient information
+in the uploaded documents."
+
+- Give a clear and concise answer.
 
 Document Context:
 
@@ -208,10 +206,45 @@ Question:
 Answer:
 """
 
+        # --------------------------------------------------
+        # 6. LLM GENERATION
+        # --------------------------------------------------
+
+        llm_start = time.perf_counter()
+
         response = self.client.models.generate_content(
             model=settings.GEMINI_MODEL,
             contents=prompt,
         )
+
+        llm_time = (
+            time.perf_counter() - llm_start
+        )
+
+        total_time = (
+            time.perf_counter() - total_start
+        )
+
+        # --------------------------------------------------
+        # 7. FINAL DIAGNOSTICS
+        # --------------------------------------------------
+
+        print(
+            f"LLM generation time: "
+            f"{llm_time:.4f} sec"
+        )
+
+        print(
+            f"Total query time: "
+            f"{total_time:.4f} sec"
+        )
+
+        print(
+            f"Sources returned: "
+            f"{len(sources)}"
+        )
+
+        print("=" * 60)
 
         return {
             "answer": response.text,
