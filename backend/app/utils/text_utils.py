@@ -2,16 +2,15 @@ import re
 from collections import Counter
 from typing import List
 
-
 import nltk
 from nltk.tokenize import sent_tokenize
 
 
-# Download tokenizer once (only if not already available)
-try:
-    nltk.data.find("tokenizers/punkt")
-except LookupError:
-    nltk.download("punkt")
+for resource in ("tokenizers/punkt", "tokenizers/punkt_tab"):
+    try:
+        nltk.data.find(resource)
+    except LookupError:
+        nltk.download(resource.split("/")[-1])
 
 
 def clean_text(text: str) -> str:
