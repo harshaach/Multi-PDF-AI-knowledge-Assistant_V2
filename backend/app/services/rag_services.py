@@ -1,8 +1,13 @@
-from google import genai
 import time
+
+from google import genai
+from google.genai.errors import ClientError, ServerError
 
 from app.config.settings import settings
 from app.services.embedding_services import EmbeddingService
+
+_MAX_RETRIES = 3
+_RETRY_WAIT_SECONDS = 5  # short backoff for transient 503s
 
 
 class RAGService:
@@ -32,6 +37,40 @@ class RAGService:
     ):
         self.embedding_service = embedding_service
         self.client = genai.Client(api_key=api_key)
+
+    # --------------------------------------------------
+    # Resilient LLM call
+    # --------------------------------------------------
+
+    def _generate_with_retry(self, contents: str):
+        """
+        Calls Gemini's generate_content with retries for
+        transient errors (503 server overload, 429 rate limit).
+        """
+        last_error = None
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                return self.client.models.generate_content(
+                    model=settings.GEMINI_MODEL,
+                    contents=contents,
+                )
+            except (ServerError, ClientError) as e:
+                last_error = e
+                is_retryable = getattr(e, "code", None) in (429, 503)
+
+                if is_retryable and attempt < _MAX_RETRIES - 1:
+                    print(
+                        f"LLM call failed ({e.code}), "
+                        f"retrying in {_RETRY_WAIT_SECONDS}s "
+                        f"(attempt {attempt + 1}/{_MAX_RETRIES})"
+                    )
+                    time.sleep(_RETRY_WAIT_SECONDS)
+                    continue
+
+                raise
+
+        raise last_error
 
     # --------------------------------------------------
     # Main RAG Pipeline
@@ -86,10 +125,7 @@ class RAGService:
 
             llm_start = time.perf_counter()
 
-            response = self.client.models.generate_content(
-                model=settings.GEMINI_MODEL,
-                contents=question,
-            )
+            response = self._generate_with_retry(question)
 
             llm_time = (
                 time.perf_counter() - llm_start
@@ -212,10 +248,7 @@ Answer:
 
         llm_start = time.perf_counter()
 
-        response = self.client.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
-        )
+        response = self._generate_with_retry(prompt)
 
         llm_time = (
             time.perf_counter() - llm_start
