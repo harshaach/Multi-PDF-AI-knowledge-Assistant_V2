@@ -7,31 +7,29 @@ from sentence_transformers import SentenceTransformer
 from app.config.settings import settings
 from app.models.chunk import Chunk
 
+# Loaded ONCE, shared by every workspace — this is the expensive part.
+_shared_model = SentenceTransformer(settings.EMBEDDING_MODEL)
+
 
 class EmbeddingService:
     """
     Handles embedding generation, FAISS indexing,
     and semantic search.
 
-    Each workspace owns one EmbeddingService,
-    so documents remain isolated per chat/workspace.
+    The embedding model is shared across all workspaces;
+    only the FAISS index and chunk list are per-workspace.
     """
 
-    def __init__(
-        self,
-        model_name: str = settings.EMBEDDING_MODEL,
-    ):
-        self.model = SentenceTransformer(model_name)
+    def __init__(self):
+        self.model = _shared_model  # reuse the shared instance
 
         self.dimension = (
             self.model.get_sentence_embedding_dimension()
         )
 
-        self.index = faiss.IndexFlatIP(
-            self.dimension
-        )
-
+        self.index = faiss.IndexFlatIP(self.dimension)
         self.chunks: List[Chunk] = []
+
 
     # =========================================================
     # ADD CHUNKS
