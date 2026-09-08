@@ -2,34 +2,59 @@ from typing import List
 
 import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from google import genai
+from google.genai import types
 
 from app.config.settings import settings
 from app.models.chunk import Chunk
 
-# Loaded ONCE, shared by every workspace — this is the expensive part.
-_shared_model = SentenceTransformer(settings.EMBEDDING_MODEL)
+# Loaded once, shared by every workspace — a lightweight API client, not a local model.
+_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+
+_EMBEDDING_MODEL = "gemini-embedding-001"
+_EMBEDDING_DIM = 768  # reduced output dimensionality (keeps FAISS index small)
+
+
+def _embed_texts(texts: List[str], task_type: str) -> np.ndarray:
+    """
+    Calls Gemini's embedding API for a batch of texts.
+
+    task_type: 'RETRIEVAL_DOCUMENT' for chunks being indexed,
+               'RETRIEVAL_QUERY' for search queries.
+    """
+    result = _client.models.embed_content(
+        model=_EMBEDDING_MODEL,
+        contents=texts,
+        config=types.EmbedContentConfig(
+            task_type=task_type,
+            output_dimensionality=_EMBEDDING_DIM,
+        ),
+    )
+
+    vectors = [e.values for e in result.embeddings]
+
+    return np.array(vectors, dtype=np.float32)
 
 
 class EmbeddingService:
     """
-    Handles embedding generation, FAISS indexing,
+    Handles embedding generation (via Gemini API), FAISS indexing,
     and semantic search.
 
-    The embedding model is shared across all workspaces;
-    only the FAISS index and chunk list are per-workspace.
+    Each workspace owns one EmbeddingService, so documents remain
+    isolated per chat/workspace. The embedding client itself is a
+    shared, lightweight API client — not a local model — so this
+    is cheap to create per workspace.
     """
 
     def __init__(self):
-        self.model = _shared_model  # reuse the shared instance
+        self.dimension = _EMBEDDING_DIM
 
-        self.dimension = (
-            self.model.get_sentence_embedding_dimension()
+        self.index = faiss.IndexFlatIP(
+            self.dimension
         )
 
-        self.index = faiss.IndexFlatIP(self.dimension)
         self.chunks: List[Chunk] = []
-
 
     # =========================================================
     # ADD CHUNKS
@@ -57,9 +82,9 @@ class EmbeddingService:
             for chunk in chunks
         ]
 
-        embeddings = self.model.encode(
+        embeddings = _embed_texts(
             texts,
-            convert_to_numpy=True,
+            task_type="RETRIEVAL_DOCUMENT",
         )
 
         faiss.normalize_L2(
@@ -67,7 +92,7 @@ class EmbeddingService:
         )
 
         self.index.add(
-            embeddings.astype(np.float32)
+            embeddings
         )
 
         self.chunks.extend(chunks)
@@ -120,9 +145,9 @@ class EmbeddingService:
             for chunk in self.chunks
         ]
 
-        embeddings = self.model.encode(
+        embeddings = _embed_texts(
             texts,
-            convert_to_numpy=True,
+            task_type="RETRIEVAL_DOCUMENT",
         )
 
         faiss.normalize_L2(
@@ -130,7 +155,7 @@ class EmbeddingService:
         )
 
         self.index.add(
-            embeddings.astype(np.float32)
+            embeddings
         )
 
     # =========================================================
@@ -157,9 +182,9 @@ class EmbeddingService:
             "time"
         ).perf_counter()
 
-        query_embedding = self.model.encode(
+        query_embedding = _embed_texts(
             [query],
-            convert_to_numpy=True,
+            task_type="RETRIEVAL_QUERY",
         )
 
         faiss.normalize_L2(
@@ -190,7 +215,7 @@ class EmbeddingService:
         )
 
         scores, indices = self.index.search(
-            query_embedding.astype(np.float32),
+            query_embedding,
             search_k,
         )
 
