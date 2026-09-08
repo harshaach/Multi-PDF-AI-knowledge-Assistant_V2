@@ -13,27 +13,38 @@ _client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
 _EMBEDDING_MODEL = "gemini-embedding-001"
 _EMBEDDING_DIM = 768  # reduced output dimensionality (keeps FAISS index small)
+_MAX_BATCH_SIZE = 100  # Gemini's embed_content limit per request
 
 
 def _embed_texts(texts: List[str], task_type: str) -> np.ndarray:
     """
     Calls Gemini's embedding API for a batch of texts.
 
+    Splits into chunks of at most 100 items per API call,
+    since Gemini's embed_content enforces that limit.
+
     task_type: 'RETRIEVAL_DOCUMENT' for chunks being indexed,
                'RETRIEVAL_QUERY' for search queries.
     """
-    result = _client.models.embed_content(
-        model=_EMBEDDING_MODEL,
-        contents=texts,
-        config=types.EmbedContentConfig(
-            task_type=task_type,
-            output_dimensionality=_EMBEDDING_DIM,
-        ),
-    )
+    all_vectors = []
 
-    vectors = [e.values for e in result.embeddings]
+    for i in range(0, len(texts), _MAX_BATCH_SIZE):
+        batch = texts[i : i + _MAX_BATCH_SIZE]
 
-    return np.array(vectors, dtype=np.float32)
+        result = _client.models.embed_content(
+            model=_EMBEDDING_MODEL,
+            contents=batch,
+            config=types.EmbedContentConfig(
+                task_type=task_type,
+                output_dimensionality=_EMBEDDING_DIM,
+            ),
+        )
+
+        all_vectors.extend(
+            e.values for e in result.embeddings
+        )
+
+    return np.array(all_vectors, dtype=np.float32)
 
 
 class EmbeddingService:
