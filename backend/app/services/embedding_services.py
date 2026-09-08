@@ -1,9 +1,11 @@
+import time
 from typing import List
 
 import faiss
 import numpy as np
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError
 
 from app.config.settings import settings
 from app.models.chunk import Chunk
@@ -14,14 +16,17 @@ _client = genai.Client(api_key=settings.GEMINI_API_KEY)
 _EMBEDDING_MODEL = "gemini-embedding-001"
 _EMBEDDING_DIM = 768  # reduced output dimensionality (keeps FAISS index small)
 _MAX_BATCH_SIZE = 100  # Gemini's embed_content limit per request
+_MAX_RETRIES = 5
+_RETRY_WAIT_SECONDS = 60  # free-tier quota resets per minute
 
 
 def _embed_texts(texts: List[str], task_type: str) -> np.ndarray:
     """
     Calls Gemini's embedding API for a batch of texts.
 
-    Splits into chunks of at most 100 items per API call,
-    since Gemini's embed_content enforces that limit.
+    Splits into chunks of at most 100 items per API call
+    (Gemini's embed_content batch limit), and retries with
+    a wait if the free-tier rate limit (429) is hit.
 
     task_type: 'RETRIEVAL_DOCUMENT' for chunks being indexed,
                'RETRIEVAL_QUERY' for search queries.
@@ -31,14 +36,35 @@ def _embed_texts(texts: List[str], task_type: str) -> np.ndarray:
     for i in range(0, len(texts), _MAX_BATCH_SIZE):
         batch = texts[i : i + _MAX_BATCH_SIZE]
 
-        result = _client.models.embed_content(
-            model=_EMBEDDING_MODEL,
-            contents=batch,
-            config=types.EmbedContentConfig(
-                task_type=task_type,
-                output_dimensionality=_EMBEDDING_DIM,
-            ),
-        )
+        result = None
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                result = _client.models.embed_content(
+                    model=_EMBEDDING_MODEL,
+                    contents=batch,
+                    config=types.EmbedContentConfig(
+                        task_type=task_type,
+                        output_dimensionality=_EMBEDDING_DIM,
+                    ),
+                )
+                break
+
+            except ClientError as e:
+                is_rate_limit = (
+                    getattr(e, "code", None) == 429
+                )
+
+                if is_rate_limit and attempt < _MAX_RETRIES - 1:
+                    print(
+                        f"Rate limited, waiting "
+                        f"{_RETRY_WAIT_SECONDS}s before "
+                        f"retry {attempt + 1}/{_MAX_RETRIES}"
+                    )
+                    time.sleep(_RETRY_WAIT_SECONDS)
+                    continue
+
+                raise
 
         all_vectors.extend(
             e.values for e in result.embeddings
